@@ -6,6 +6,7 @@
  *           (C) 2018 Artix Linux Developers
  *
  * To see the license terms of this program, see COPYING
+ * (FORK)
  */
 
 #include <stdio.h>
@@ -20,23 +21,26 @@ extern char *__progname;
 typedef enum {NOOP, REBOOT, POWEROFF, WRITE_ONLY} action_type;
 typedef enum {OPENRC, RUNIT} initsys;
 
-const char* get_init()
+/* * Optimized init detection: 
+ * We use a static buffer to avoid heap allocation and leaks.
+ */
+initsys detect_init(void)
 {
-    char *name = (char *)calloc(1024,sizeof(char));
-    if(name) {
-        sprintf(name, "/proc/1/cmdline");
-        FILE *f = fopen(name, "r");
-        if (f) {
-            size_t size;
-            size = fread(name, sizeof(char), 1024, f);
-            if (size > 0) {
-                if ('\n' == name[size-1])
-                    name[size-1]='\0';
-            }
-            fclose(f);
-        }
+    char buf[256];
+    FILE *f = fopen("/proc/1/cmdline", "r");
+    if (!f) return OPENRC; // Default to OpenRC if proc is not mounted
+
+    size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+
+    if (len > 0) {
+        buf[len] = '\0';
+        /* * /proc/1/cmdline can contain absolute paths like /sbin/init 
+         * or just the name. We search for "runit" within the first argument.
+         */
+        if (strstr(buf, "runit")) return RUNIT;
     }
-    return name;
+    return OPENRC;
 }
 
 int main(int argc, char *argv[])
@@ -46,84 +50,79 @@ int main(int argc, char *argv[])
 
     int do_sync = 1;
     int do_force = 0;
-    int write_only = 0;
     int opt;
     action_type action = NOOP;
-    initsys init;
-    const char *initfile = get_init();
-    char openrc_options[50];
+    initsys init = detect_init();
+    
+    /* Initialize options buffer to avoid garbage values */
+    char openrc_options[64] = "";
 
-    if (strcmp(initfile, "runit") == 0)
-        init = RUNIT;
-    else init = OPENRC;
-
+    /* Determine action based on program name */
     if (strcmp(__progname, "reboot") == 0)
         action = REBOOT;
-    else if (strcmp(__progname, "halt") == 0 || strcmp(__progname, "poweroff") == 0 || strcmp(__progname, "shutdown") == 0)
+    else if (strcmp(__progname, "halt") == 0 || 
+             strcmp(__progname, "poweroff") == 0 || 
+             strcmp(__progname, "shutdown") == 0)
         action = POWEROFF;
-    else
-        warnx("No default behavior, needs to be called as halt/reboot/poweroff/shutdown.");
 
-    while ((opt = getopt(argc, argv, "dfhinw")) != -1)
+    while ((opt = getopt(argc, argv, "dfhinw")) != -1) {
         switch (opt) {
         case 'n':
             do_sync = 0;
-            strcat(openrc_options, "--no-write");
+            if (init == OPENRC) strncat(openrc_options, " --no-write", sizeof(openrc_options) - 1);
             break;
         case 'w':
-            if (init == RUNIT)
-                action = NOOP;
-            else
-                action = WRITE_ONLY;
+            action = (init == RUNIT) ? NOOP : WRITE_ONLY;
             do_sync = 0;
             break;
         case 'd':
-            strcat(openrc_options, "--no-write");
-            break;
-        case 'h':
-        case 'i':
+            if (init == OPENRC) strncat(openrc_options, " --no-write", sizeof(openrc_options) - 1);
             break;
         case 'f':
             do_force = 1;
             break;
+        case 'h':
+        case 'i':
+            /* Flags accepted but ignored for compatibility */
+            break;
         default:
-            errx(1, "Usage: %s [-n] [-f]", __progname);
+            errx(1, "Usage: %s [-n] [-f] [-w] [-d]", __progname);
         }
+    }
 
     if (do_sync)
         sync();
 
     switch (action) {
         case POWEROFF:
-            if (do_force)
+            if (do_force) {
                 reboot(RB_POWER_OFF);
-            else
-                switch (init) {
-                    case RUNIT:
-                        execl("/usr/bin/runit-init", "init", "0", (char*)0);
-                        break;
-                    case OPENRC:
-                        execl("/usr/bin/openrc-shutdown", "openrc-shutdown", "--poweroff", "now", openrc_options, (char*)0);
-                        break;
-                }
+            } else {
+                if (init == RUNIT)
+                    execl("/usr/bin/runit-init", "init", "0", (char*)NULL);
+                else
+                    execl("/usr/bin/openrc-shutdown", "openrc-shutdown", "--poweroff", "now", openrc_options, (char*)NULL);
+            }
             err(1, "poweroff failed");
             break;
+
         case REBOOT:
-            if (do_force)
+            if (do_force) {
                 reboot(RB_AUTOBOOT);
-            else
-                switch(init) {
-                    case RUNIT:
-                        execl("/usr/bin/runit-init", "init", "6", (char*)0);
-                        break;
-                    case OPENRC:
-                        execl("/usr/bin/openrc-shutdown", "openrc-shutdown", "--reboot", "now", openrc_options, (char*)0);
-                        break;
-                }
+            } else {
+                if (init == RUNIT)
+                    execl("/usr/bin/runit-init", "init", "6", (char*)NULL);
+                else
+                    execl("/usr/bin/openrc-shutdown", "openrc-shutdown", "--reboot", "now", openrc_options, (char*)NULL);
+            }
             err(1, "reboot failed");
             break;
-        case WRITE_ONLY: /* only applicable for OpenRC */
-            execl("/usr/bin/openrc-shutdown", "openrc-shutdown", "--write-only", (char*)0);
+
+        case WRITE_ONLY:
+            execl("/usr/bin/openrc-shutdown", "openrc-shutdown", "--write-only", (char*)NULL);
+            err(1, "write-only failed");
+            break;
+
         case NOOP:
             break;
     }
